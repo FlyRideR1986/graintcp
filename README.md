@@ -1,237 +1,1452 @@
-# GrainTCP
+# GrainTCP.js 详细注释版
 
-`GrainTCP.js` 是一个基于 Cloudflare Workers 的 VLESS over WebSocket TCP 转发实现，重点不在附加协议功能，而在于围绕真实代理路径收敛小包传输优化。
+项目来自大佬：
 
-## 核心能力
+> 目标：
+>
+> 这份文档不是简单“翻译代码”，而是从 Cloudflare Workers、VLESS、WebSocket、TCP Socket、队列聚合、DoH DNS、HTTP/SOCKS5 代理 等多个角度，解释整个脚本的设计思路。
+>
+> 重点是：
+>
+> * 每一层到底在干什么
+> * 为什么这么写
+> * 性能优化点在哪里
+> * 哪些是 GrainTCP 原始设计
+> * 哪些是你后续新增的改造
+> * 哪些地方可能影响 Cloudflare 风控
+>
+> 适合：
+>
+> * 二次开发
+> * 学习 Workers Socket
+> * 理解 VLESS over WS
+> * 理解 GrainTCP 的“grain 聚合”思想
+> * 后续继续改造成 xhttp / h2 / h3 / udp / dns 等形态
 
-当前代码主线包含：
+---
 
-- VLESS 普通 TCP 请求解析
-- WebSocket early data 接入
-- `request.fetcher.connect()` TCP 出站
-- 并发拨号竞争首个成功连接
-- 上传侧小包队列合并
-- 下载侧 grain 聚合回传
-- BYOB 读取转发
+# 第一章：这个脚本整体到底是什么
 
-## 代码主路径
+这是一个：
 
 ```text
-VLESS over WebSocket
-  → 解析 UUID / 目标地址 / 端口
-  → `request.fetcher.connect()` 并发建立 TCP
-  → 上传侧显式队列化机会性合包后写入
-  → 下载侧 grain 聚合回传
+VLESS over WebSocket over Cloudflare Workers
 ```
 
-## 出站接口
+的 TCP 转发器。
 
-当前代码最突出的点之一，就是**最先把 `request.fetcher.connect()` 这条灰接口直接引入到实际 VLESS TCP 主线里使用**，而不是继续停留在公开 `cloudflare:sockets.connect()` 的常规路径上。
+同时你在 v2 里面新增了：
 
-| 方式 | 类型 | 当前结论 |
-| --- | --- | --- |
-| `cloudflare:sockets.connect()` | 公开 API | 正式、稳定、直接出公网 TCP |
-| `request.fetcher.connect()` | undocumented 灰接口 | 当前代码实际使用；同样可直接出公网 TCP，但接口形态与可用性更依赖平台实现 |
+| 模块               | 作用                                 |
+| ---------------- | ---------------------------------- |
+| HTTP CONNECT 代理  | Worker 出口再套一层 HTTP 代理              |
+| SOCKS5 代理        | Worker 出口再套一层 SOCKS5               |
+| proxyIP fallback | 直连失败后回退                            |
+| UDP DNS -> DoH   | 把 UDP DNS 转成 HTTPS DNS             |
+| 并发 connect       | 多路同时拨号抢最快                          |
+| grain 聚合         | 小包合并降低 syscall 和 websocket send 次数 |
+| BYOB Reader      | 减少内存复制                             |
 
-需要区分的一点：
+本质上它不是传统“完整代理核心”。
 
-- 当前代码用的是 **request 级 `fetcher.connect()`**
-- 不是公开 service binding 那条 `Fetcher.connect()` 路径
-
-从 workerd 源码层面看，这两条入口最终都会落到同一套底层 TCP 建连实现上；差异主要不在“另一套 socket 引擎”，而在 **JS 层入口、fetcher 归属和通道来源**。
-
-对当前这份代码来说，`request.fetcher.connect()` 的意义主要有两点：
-
-1. 它不是公开导入 `cloudflare:sockets` 模块的常规写法，而是 **直接在 request 级 JS 上下文里取出的灰接口**  
-2. 在代码特征上，这条路径相比常规公开 socket 入口更小
-
-但要分清：
-
-- 这更接近 **入口形态差异**
-- 不是已经被源码或实测完全证明成“底层能力高一档的新 socket”
-
-当前可以确认的是：
-
-- `request.fetcher.connect()` **确实能直接出公网 TCP**
-- 它在底层仍与公开 `connect()` 共享同类建连路径
-- 它作为 JS 层新引入的灰接口，代码特征比常规公开 socket 模块更小
-
-## 设计重点
-
-### 1. UUID 热路径
-
-与以往所有代码不同，这一版没有把 UUID 校验继续留在请求期做循环逐字节比对，而是把 UUID 预解码前移到模块初始化阶段：先转成 16 字节，再拆成固定标量常量。
-
-这样请求真正进入 `vless()` 主线后，UUID 这一步只剩下两件事：
-
-- 长度不足直接返回
-- 16 个字节做固定位置直接比较，失败立刻返回
-
-这条路径的目的很明确：**把一次性工作留在初始化，把请求热路径压成最短的固定宽度判断**。对 `workerd` / V8 这类运行时来说，这比在每次请求里保留循环、偏移计算和额外分支更容易收紧成稳定热路径。
-
-本地 `Node v20.19.4` 基准：
-
-| 路径 | 以往处理方式 | 当前实现 | 谁更快 |
-| --- | ---: | ---: | --- |
-| UUID 命中匹配 | `53.26 ns/op` | `9.44 ns/op` | 当前实现约 `5.6x` |
-| UUID 尾部错误快速拒绝 | `51.63 ns/op` | `11.00 ns/op` | 当前实现约 `4.7x` |
-| 完整 `vless()` 有效包解析 | `220.67 ns/op` | `187.09 ns/op` | 当前实现约 `1.18x` |
-| 完整 `vless()` 错误包快速拒绝 | `52.56 ns/op` | `23.14 ns/op` | 当前实现约 `2.3x` |
-
-这里的 UUID 路径已经压到了 **纳秒级匹配 + 亚微秒级完整解析**，四项热路径对比里当前实现全部更快。
-
-### 2. 上传侧显式队列化机会性合包
-
-上传侧已经收敛下来。
-
-这条路径不是单纯“收到一包写一包”，而是在 `writer.write()` 前先放进一个轻量有界队列：**如果当前写入还没结束，就顺手把后续小块继续收进来；一旦轮到当前连接继续写，就把连续小块尽量合并后再送进去。**
-
-这里不是单一缓冲，而是 **显式队列化 + 机会性合包 + microtask drain**：
-
-- 显式队列：先收进有界队列，而不是直接抢写
-- 机会性合包：只在当前写入未完成、或同一轮事件里已经连续到包时，顺手把后续小块一起并进去
-- microtask drain：当前轮写完后，立刻在下一轮 microtask 继续清队列，而不是把每个小包都拆成独立写流程
-
-这部分思路主要参考了两个库，但不是原样照搬：
-
-- **`iter-streams` / `new-streams`**：主要参考它的 **显式 push / backpressure / batched chunks** 这部分思路，也就是 `Stream.push()`、`highWaterMark`、`writev()` 这一套“先进入有界队列，再把多块合成更少写入”的设计
-- **`fast-webstreams`**：主要参考它对 **per-chunk Promise / microtask / JS queue 成本** 的判断，以及 **write batching + 更轻调度** 这部分方向。也就是先尽量减少写入次数，再减少每块各跑一轮调度的额外开销
-
-当前这段上传侧逻辑可以直接概括成：
-
-- 从 `iter-streams` 借来 **显式队列化 / batched write** 的骨架
-- 从 `fast-webstreams` 借来 **减少每块调度成本 / microtask 收敛 drain** 的取向
-
-这样做的目的很直接：
-
-- 减少高频小 `writer.write()` 调用
-- 减少 tiny packet storm 带来的固定调度成本
-- 把原始很多条细碎 message，压成更少的实际写入次数
-
-从模型上看，这条路径的核心就是把上行 `N_msg` 压到更小的 `N_up`。在小包足够碎、到达足够密的场景里，目标效果就是把**几千条原始小消息收敛成几十次实际写入**；最终比例取决于消息大小、间隔和 `upPack`，不是固定常数。
-
-当前实现对应：
-
-- `mkQ()`：有界收纳 + 合包
-- `upPack = 16KB`：单次机会性合包目标
-- `upQMax = 256KB`：显式队列上限
-- `queueMicrotask(...)`：把下一轮 drain 压到当前轮事件之后，给同轮连续小块一个极短暂的并包窗口
-
-这条路优化的是 **JS 层写入次数和调度形态**。
-
-它的价值是 **削减高频小包带来的固定成本**。
-
-### 3. 下载侧 grain 聚合
-
-下载侧分成两部分：
-
-- **已定型的是大包直发主线**
-- **还在继续收敛的是 `<32KB` 小包 smoothing**
-
-当前代码的下行主线很明确：
-
-- **大包**：`tx.reap()` → `ws.send(v)` → 立刻换新 BYOB buffer
-- **小包**：`v.slice()` 脱离原读缓冲 → 进入 grain 聚合
-
-大包直发已经定型，原因很直接：
-
-- `ws.send(Uint8Array)` 底层不是立刻深拷贝，而是把当前 view 对应的 backing store 挂进 `outgoingMessages` 异步队列
-- 所以大包如果先 `slice()` 再发，只会平白多一次 JS copy
-- direct send 之后，这块读缓冲又不能继续复用，所以必须立刻换新 buffer
-
-大包路径现在就是一句话：
-
-> **direct send，随后立刻换新 buffer**
-
-这也是它比旧式“先大缓冲、再定时 flush”的下载写法更省开销的原因：
-
-- 旧写法会额外维护一整套大缓冲、offset、timer、resume、flush 状态
-- 大块数据常常先复制，再 send
-- 进入大文件阶段后，还会继续塞进 JS 缓冲再等定时器发出
-
-而当前这版的大包路径只保留两个必要动作：
-
-- **直接 send**
-- **换新 buffer**
-
-少了一次大块复制，也少了一层 JS 缓冲和 timer 状态机。
-
-当前继续优化的是小包这一半，而且这里的 `32KB` 不是“必须攒满才发”的目标，而是 **聚合上限**：
-
-- `>= 32KB` 直接发
-- `< 32KB` 先进入 staging buffer
-- 缓冲接近上限、同轮连续小包折叠完成，或极短 quiet-window 结束后就发
-
-所以它不是简单缓存，而是 **microtask 折叠 + 极短 quiet-window** 的轻量聚合。
-
-这部分针对的是 **高频小 frame 场景**：把很多 `<32KB` 小块压成更少的 `ws.send()` 次数，减少 frame 数、调度次数和 runtime 队列压力。
-
-它不是完整流控，也不是背压系统。`WebSocket.send()` 仍然没有可用的 drain / backpressure 信号；客户端慢的时候，runtime 内部队列仍然会继续增长。这个聚合器能做的，是尽量减小高频小 frame 对 `send()` 队列的放大。
-
-当前把 `dnPack` 收在 `32KB`，是因为更小的 `2KB / 4KB / 8KB` 虽然也会做一点合并，但还停留在原始小包尺度里，只有 `32KB` 才能把小包 frame 数压到另一个数量级。
-
-`chunk = 64KB` 也只是当前通用默认档，不是源码硬上限。它的含义更接近“普通混合流量下更稳的工程档位”；在明确的大文件 bulk 场景里，更大的读块仍然可能成立。
-
-下载侧也没有继续走重型 JS 队列路线。`ws.send()` 底层本来就有自己的异步发送队列，JS 层再额外堆一整套大缓冲、timer 和状态机，通常只会多一次合并拷贝和更多调度开销。当前主线保留的是轻量小包聚合，不再重做一层下载发送系统。
-
-简化模型：
+它更像：
 
 ```text
-T_direct = 32KB
-N_down ≈ B_down / E_down
-Cost_down ≈ N_down * (C_loop + F_big * C_rebuf) + P_small * B_down * k_slice
-Q_ws_out' ≈ R_sock_read - R_ws_drain
+Cloudflare Worker 上的极限轻量 TCP 转发内核
 ```
 
-含义：
+设计目标是：
 
-- `T_direct`：大小包分界；`>= 32KB` 直发，`< 32KB` 进入轻量聚合
-- `E_down`：下行平均交付块大小；越大，`N_down` 越小，`read + send + loop` 固定成本越低
-- `P_small`：走小包分支的字节占比；越高，`slice()` 复制成本越高
-- `F_big`：走大包直发分支的迭代占比；越高，补新 BYOB buffer 的次数越多
-- `Q_ws_out`：`ws.send()` 之后 runtime 内部的隐藏发送队列；当 `R_sock_read > R_ws_drain` 时继续增长
+* 极少对象创建
+* 极少 await
+* 极少 buffer copy
+* 极少 websocket send 次数
+* 尽量减少 CF runtime 开销
 
-当前主参数：
+所以它代码会显得：
 
-- `dnPack = 32KB`
-- `dnTail = 512B`
-- `dnMs = 0`
+```text
+非常短
+非常密集
+非常不像传统工程代码
+```
 
-### 4. 并发拨号
+这是刻意的。
 
-当 `concur = 4` 时，会同时发起多路 TCP 建连，谁先成功就使用谁，其余连接关闭。主要用于改善部分入口下的首连成功率和首包速度。
+---
 
-当前 `4` 对应的是 **Workers / Pages 部署下的默认配置**。如果把这份代码改成 **Snippets** 形态使用，并发拨号应手动收回到 `1`，不要继续保留 `4`。
+# 第二章：整体架构图
 
-## 当前配置
+整体链路：
 
-| 变量 | 意义 | 默认值 |
-| --- | --- | --- |
-| `id` | VLESS UUID | `2523c510-9ff0-415b-9582-93949bfae7e3` |
-| `chunk` | BYOB 读取块大小 | `64 * 1024` |
-| `dnPack` | 下载侧 grain 聚合上限 | `32 * 1024` |
-| `dnTail` | 下载侧尾部阈值 | `512` |
-| `dnMs` | 下载侧延迟窗口 | `0` |
-| `upPack` | 上传侧合包目标 | `16 * 1024` |
-| `upQMax` | 上传队列上限 | `256 * 1024` |
-| `maxED` | early data 上限 | `8 * 1024` |
-| `concur` | 并发拨号数；Workers / Pages 默认 `4`，Snippets 手动改 `1` | `4` |
+```text
+客户端
+    ↓
+VLESS
+    ↓
+WebSocket
+    ↓
+Cloudflare Worker
+    ↓
+解析 VLESS Header
+    ↓
+建立 TCP Socket
+    ↓
+目标网站
+```
 
-这些值对应的是当前主线路径下的收敛结果，不是随意占位参数。
+如果启用代理：
 
-## 文件
+```text
+客户端
+  ↓
+Worker
+  ↓
+HTTP CONNECT / SOCKS5
+  ↓
+目标网站
+```
 
-| 文件 | 说明 |
+如果是 DNS：
+
+```text
+客户端 UDP:53
+    ↓
+VLESS UDP
+    ↓
+Worker
+    ↓
+DoH
+    ↓
+1.1.1.1/dns-query
+```
+
+---
+
+# 第三章：CFG 配置区
+
+原始代码：
+
+```js
+const CFG = {
+  id: 'df8d0820-dec9-4cda-bae5-c57dad83a029',
+  chunk: 64 * 1024,
+  dnPack: 32 * 1024,
+  dnTail: 512,
+  dnMs: 0,
+  upPack: 16 * 1024,
+  upQMax: 256 * 1024,
+  maxED: 8 * 1024,
+  concur: 4,
+  doh: 'https://1.1.1.1/dns-query'
+};
+```
+
+---
+
+## 1. id
+
+VLESS UUID。
+
+用于鉴权。
+
+这里用了：
+
+```text
+热路径 UUID 匹配
+```
+
+而不是：
+
+```text
+字符串 compare
+```
+
+这是 GrainTCP 一个非常核心的性能优化。
+
+后面会详细解释。
+
+---
+
+## 2. chunk
+
+```js
+chunk: 64 * 1024
+```
+
+表示：
+
+```text
+每次读取 TCP 数据时的最大块大小
+```
+
+用于：
+
+```js
+reader.read(new Uint8Array(buf, 0, CFG.chunk))
+```
+
+64KB 是典型 TCP 大块。
+
+优点：
+
+* 减少 read 次数
+* 减少 JS 调度
+* 减少 websocket send 次数
+
+缺点：
+
+* 延迟会略大
+* 小流量会浪费 buffer
+
+所以后面 GrainTCP 又用了 grain 聚合平衡。
+
+---
+
+## 3. dnPack
+
+```js
+dnPack: 32 * 1024
+```
+
+下载方向：
+
+```text
+TCP -> WebSocket
+```
+
+聚合包大小。
+
+意思是：
+
+```text
+小包先攒一攒
+再一起 websocket.send()
+```
+
+这是 GrainTCP 最核心思想。
+
+因为：
+
+```text
+CF Worker 的 websocket.send() 很贵
+```
+
+频繁小包会：
+
+* CPU 上升
+* syscall 增多
+* runtime 压力大
+* 容易触发风控
+
+所以 GrainTCP 的核心：
+
+```text
+不是减少网络包
+而是减少 JS runtime 调度
+```
+
+这是很关键的思想。
+
+---
+
+## 4. dnTail
+
+```js
+dnTail: 512
+```
+
+表示：
+
+```text
+buffer 剩余空间小于 512 时立刻发送
+```
+
+避免：
+
+```text
+最后一点空间导致 buffer 卡住
+```
+
+---
+
+## 5. dnMs
+
+```js
+dnMs: 0
+```
+
+grain 聚合等待时间。
+
+实际上：
+
+```js
+Math.max(CFG.dnMs, 1)
+```
+
+最低还是 1ms。
+
+作用：
+
+```text
+允许更多小包合并
+```
+
+这是一种：
+
+```text
+吞吐 vs 延迟
+```
+
+的 tradeoff。
+
+---
+
+## 6. upPack
+
+上传方向聚合大小。
+
+```text
+WebSocket -> TCP
+```
+
+---
+
+## 7. upQMax
+
+上传队列最大缓存。
+
+```js
+256 * 1024
+```
+
+避免：
+
+```text
+客户端疯狂发包导致内存爆炸
+```
+
+---
+
+## 8. maxED
+
+early data 最大长度。
+
+对应：
+
+```http
+sec-websocket-protocol
+```
+
+里的 base64 数据。
+
+这是很多 VLESS WS 配置的：
+
+```text
+0-RTT / early data
+```
+
+玩法。
+
+---
+
+## 9. concur
+
+```js
+concur: 4
+```
+
+并发拨号数量。
+
+核心逻辑：
+
+```text
+同时 connect 4 次
+谁先成功用谁
+剩下全部 close
+```
+
+这个是：
+
+```text
+Cloudflare Worker 特有优化
+```
+
+因为 Worker connect 有时会：
+
+* 某条链路抖动
+* 某个 colo 不稳定
+* 某次 socket 建立卡住
+
+并发 connect 可以降低 tail latency。
+
+但：
+
+```text
+concur 越大
+CF 风控风险越高
+```
+
+通常：
+
+| concur | 建议     |
+| ------ | ------ |
+| 1      | 最稳     |
+| 2      | 推荐     |
+| 4      | 激进     |
+| >4     | 风险明显增加 |
+
+---
+
+## 10. doh
+
+DoH 地址。
+
+用于：
+
+```text
+UDP DNS -> HTTPS DNS
+```
+
+---
+
+# 第四章：为什么 UUID 匹配这么奇怪
+
+代码：
+
+```js
+const idB = new Uint8Array(16)
+```
+
+后面：
+
+```js
+const matchID = c =>
+  c[1] === I0 &&
+  c[2] === I1 ...
+```
+
+很多人第一次看会懵。
+
+实际上这是：
+
+```text
+极限热路径优化
+```
+
+传统写法：
+
+```js
+uuid === xxxxx
+```
+
+会：
+
+* 创建字符串
+* decode
+* compare
+* GC
+
+而 GrainTCP：
+
+```text
+直接按字节 compare
+```
+
+好处：
+
+* 无字符串对象
+* 无 decode
+* 无额外 allocation
+* 极低 GC
+
+这就是：
+
+```text
+Snippets 风格代码
+```
+
+不是为了可读性。
+
+是为了：
+
+```text
+Cloudflare Runtime 极限性能
+```
+
+---
+
+# 第五章：addr() 地址解析
+
+代码：
+
+```js
+const addr = (t, b) =>
+```
+
+作用：
+
+把 VLESS header 里的地址解析成人类可读。
+
+支持：
+
+| 类型 | 含义   |
+| -- | ---- |
+| 1  | IPv4 |
+| 3  | 域名   |
+| 4  | IPv6 |
+
+注意：
+
+```text
+VLESS 规范里 domain 实际类型是 2
+```
+
+但这里做了偏移处理。
+
+后面你会看到：
+
+```js
+if (t !== 1) t += 1;
+```
+
+属于作者的：
+
+```text
+压缩写法
+```
+
+可读性差。
+
+但减少了 switch。
+
+---
+
+# 第六章：并发拨号 raceSprout
+
+这是整个 GrainTCP 的核心优化之一。
+
+代码逻辑：
+
+```js
+const ts = Array(CFG.concur)
+  .fill()
+  .map(() => sprout(f, h, p));
+
+return Promise.any(ts)
+```
+
+本质：
+
+```text
+Happy Eyeballs 思想
+```
+
+类似浏览器：
+
+```text
+IPv4 和 IPv6 同时拨号
+谁快用谁
+```
+
+这里只不过：
+
+```text
+是多个 CF socket 同时拨号
+```
+
+成功后：
+
+```js
+s !== w && s.close()
+```
+
+关闭剩余连接。
+
+---
+
+## 为什么这对 CF 特别有效
+
+Cloudflare Worker socket：
+
+```text
+不是传统 Linux socket
+```
+
+它底层：
+
+* 有 colo 调度
+* 有边缘网络
+* 有内部 NAT
+* 有 socket sandbox
+
+所以：
+
+```text
+某次 connect 卡住非常常见
+```
+
+并发 connect 可以降低：
+
+```text
+P99 延迟
+```
+
+但副作用：
+
+* socket 数量翻倍
+* 更像扫描行为
+* 更像机器人
+* 更容易触发风控
+
+这是为什么你后来想：
+
+```text
+concur=1
+```
+
+---
+
+# 第七章：VLESS 解析器
+
+代码：
+
+```js
+const vless = c => {
+```
+
+作用：
+
+解析：
+
+```text
+VLESS Header
+```
+
+---
+
+## VLESS 数据结构
+
+大概：
+
+```text
+version
+uuid
+addons
+command
+port
+address
+payload
+```
+
+这里：
+
+```js
+const cmd = c[18 + optLen];
+```
+
+command：
+
+| cmd | 含义  |
 | --- | --- |
-| [GrainTCP.js](./GrainTCP.js) | Worker 主实现：VLESS 解析、TCP 出站、上传 queue、下载 grain、BYOB 转发 |
+| 1   | TCP |
+| 2   | UDP |
 
-## 相关链接
+后面：
 
-- 开源协议：[GPL-3.0](./LICENSE)
-- fast-webstreams：<https://github.com/vercel-labs/fast-webstreams>
-- iter-streams：<https://github.com/WinterTC55/iter-streams>
-- 频道 / 交流群组：<https://t.me/Enkelte_notif>
+```js
+if (r.cmd === 2 && port === 53)
+```
 
-## Stargazers over time
+就是：
 
-[![Stargazers over time](https://starchart.cc/ToiCF/GrainTCP.svg?variant=adaptive)](https://starchart.cc/ToiCF/GrainTCP)
+```text
+UDP DNS 特判
+```
+
+---
+
+# 第八章：mkQ 上传队列
+
+这是 GrainTCP 的：
+
+```text
+上传方向 grain 聚合器
+```
+
+作用：
+
+```text
+减少 write 次数
+```
+
+核心思想：
+
+```text
+多个 websocket message
+合并成一次 TCP write
+```
+
+---
+
+## 为什么要这样
+
+Cloudflare Workers：
+
+```text
+每次 await writer.write()
+都很贵
+```
+
+因为：
+
+* JS runtime 调度
+* promise
+* socket bridge
+* isolate 切换
+
+都要成本。
+
+所以 GrainTCP 的思路：
+
+```text
+少 write
+大 write
+```
+
+---
+
+## sow()
+
+```js
+sow(d)
+```
+
+就是：
+
+```text
+往队列播种
+```
+
+作者故意用了农业命名。
+
+GrainTCP：
+
+```text
+grain
+sow
+reap
+ripen
+mill
+```
+
+全部是农业术语。
+
+---
+
+## bundle()
+
+核心：
+
+```text
+合包
+```
+
+把多个小包：
+
+```text
+merge 成一个 Uint8Array
+```
+
+减少 write 次数。
+
+---
+
+# 第九章：mkDn 下载聚合器
+
+这是：
+
+```text
+TCP -> WebSocket
+```
+
+方向。
+
+和 mkQ 类似。
+
+但是更复杂。
+
+因为：
+
+```text
+下载流量通常远大于上传
+```
+
+---
+
+# 第十章：ripen() 和 reap()
+
+这是 GrainTCP 最有意思的部分。
+
+---
+
+## reap
+
+```text
+收割
+```
+
+意思：
+
+```text
+立刻发送 buffer
+```
+
+---
+
+## ripen
+
+```text
+成熟
+```
+
+意思：
+
+```text
+等一等
+看看还有没有小包
+```
+
+这是：
+
+```text
+微型 batching scheduler
+```
+
+非常像：
+
+* Nagle
+* delayed ack
+* batching reactor
+
+但它是在 JS runtime 做的。
+
+---
+
+## queueMicrotask()
+
+这里非常关键。
+
+```js
+queueMicrotask(() => {
+```
+
+意思：
+
+```text
+当前 event loop 结束后再判断
+```
+
+好处：
+
+```text
+同一轮 event loop 的多个包
+可以自然合并
+```
+
+这是 GrainTCP 性能的核心之一。
+
+---
+
+# 第十一章：mill() 数据泵
+
+```js
+const mill = async (rd, w) => {
+```
+
+mill：
+
+```text
+磨坊
+```
+
+作用：
+
+```text
+把 TCP readable
+持续搬运到 websocket
+```
+
+---
+
+## 为什么用 BYOB Reader
+
+```js
+getReader({ mode: 'byob' })
+```
+
+BYOB：
+
+```text
+Bring Your Own Buffer
+```
+
+意思：
+
+```text
+不要内部自动创建 Uint8Array
+而是我自己给 buffer
+```
+
+作用：
+
+* 减少 GC
+* 减少 allocation
+* 减少 copy
+
+这在：
+
+```text
+大流量 Worker
+```
+
+里非常重要。
+
+---
+
+# 第十二章：UDP DNS over DoH
+
+这是你 v2 新增的重要能力。
+
+---
+
+## 为什么 Worker 不适合原生 UDP
+
+Cloudflare Worker：
+
+```text
+原生 UDP 支持很有限
+```
+
+尤其：
+
+```text
+不能随意裸 UDP 出口
+```
+
+所以：
+
+```text
+UDP DNS -> DoH
+```
+
+是最常见方案。
+
+---
+
+## unpackUDP()
+
+VLESS UDP：
+
+```text
+不是一个包一个 frame
+```
+
+而是：
+
+```text
+长度 + 数据
+```
+
+所以这里做拆包。
+
+---
+
+## packUDP()
+
+反过来封装。
+
+---
+
+## handleDNSQuery()
+
+核心：
+
+```js
+fetch(CFG.doh)
+```
+
+Worker 通过 HTTPS 请求：
+
+```text
+1.1.1.1/dns-query
+```
+
+然后拿回 DNS binary response。
+
+本质：
+
+```text
+DNS over HTTPS 隧道
+```
+
+---
+
+# 第十三章：ws() 主入口
+
+这是整个系统的核心。
+
+---
+
+## WebSocketPair
+
+```js
+const [client, server] = Object.values(new WebSocketPair())
+```
+
+Cloudflare Workers 特有。
+
+Worker 内部创建一对 WS。
+
+* 一个返回客户端
+* 一个自己处理
+
+---
+
+## allowHalfOpen
+
+```js
+server.accept({ allowHalfOpen: true })
+```
+
+允许半关闭。
+
+避免：
+
+```text
+一端 FIN
+另一端立刻断
+```
+
+对于代理很重要。
+
+---
+
+# 第十四章：Early Data
+
+代码：
+
+```js
+sec-websocket-protocol
+```
+
+很多人不知道：
+
+```text
+这个 header 可以偷运数据
+```
+
+VLESS WS 经常这样做。
+
+作用：
+
+```text
+减少一次 RTT
+```
+
+即：
+
+```text
+WS 建立时直接带 payload
+```
+
+这就是：
+
+```text
+0-RTT 风格
+```
+
+---
+
+# 第十五章：为什么“没有配置 http 代理也能访问 CF 网站”
+
+你之前问到的关键问题。
+
+本质：
+
+```text
+Worker 自己就在 Cloudflare 网络里
+```
+
+所以：
+
+```text
+Worker -> Cloudflare CDN
+```
+
+很多时候：
+
+* 不需要额外 proxy
+* 不需要 socks
+* 不需要回源绕路
+
+因为：
+
+```text
+本来就在 CF Backbone 里面
+```
+
+所以你会感觉：
+
+```text
+怎么没代理也能访问
+```
+
+实际上：
+
+```text
+Worker 本身已经在 CF 内网生态里
+```
+
+---
+
+# 第十六章：smartConnect() 的意义
+
+这是 v2 改造的重要部分。
+
+逻辑：
+
+```text
+优先直连
+失败再 fallback
+```
+
+---
+
+## 为什么不能默认全局 proxy
+
+因为：
+
+```text
+proxy 会增加：
+
+- RTT
+- TLS
+- connect 时间
+- 风控特征
+```
+
+所以最佳实践：
+
+```text
+优先直连
+失败再回退
+```
+
+这是你 v2 的正确方向。
+
+---
+
+# 第十七章：HTTP CONNECT 原理
+
+HTTP CONNECT：
+
+```http
+CONNECT example.com:443 HTTP/1.1
+```
+
+本质：
+
+```text
+让 HTTP 代理帮你建立 TCP 隧道
+```
+
+建立成功后：
+
+```text
+后面就变成原始 TCP
+```
+
+所以 HTTPS 可以跑。
+
+---
+
+# 第十八章：SOCKS5 原理
+
+SOCKS5 更底层。
+
+流程：
+
+```text
+认证
+↓
+CONNECT
+↓
+代理建立 TCP
+```
+
+SOCKS5：
+
+* 更通用
+* 更像原生 socket
+* 比 HTTP CONNECT 更底层
+
+---
+
+# 第十九章：为什么 GrainTCP 看起来不像“正常代码”
+
+因为它目标不是：
+
+```text
+可维护性
+```
+
+而是：
+
+```text
+极限 runtime 性能
+```
+
+很多写法：
+
+```js
+a && b && c
+```
+
+或者：
+
+```js
+if (!x) return
+```
+
+甚至：
+
+```js
+const [d] = uq.bundle();
+```
+
+都属于：
+
+```text
+减少对象
+减少变量
+减少 branch
+```
+
+风格。
+
+非常像：
+
+* demoscene
+* code golf
+* runtime-oriented JS
+
+不是传统工程代码。
+
+---
+
+# 第二十章：v1 和 v2 的核心区别
+
+---
+
+## v1
+
+特点：
+
+```text
+尽量保留 GrainTCP 原始极简风格
+```
+
+优点：
+
+* 更接近原版
+* 更轻
+* 更纯粹
+* 更像 snippets
+
+缺点：
+
+* 可读性差
+* fallback 不够完整
+* DNS 较弱
+
+---
+
+## v2
+
+特点：
+
+```text
+工程化增强
+```
+
+新增：
+
+* smartConnect
+* proxy ctx
+* DNS DoH
+* 更完整 fallback
+* 更完整 socks/http
+
+优点：
+
+* 更稳定
+* 更适合长期使用
+* 更容易继续开发
+
+缺点：
+
+* 代码更长
+* runtime 更复杂
+* 风控特征略增加
+
+---
+
+# 第二十一章：哪些地方最可能触发 Cloudflare 风控
+
+重点风险：
+
+| 模块                | 风险             |
+| ----------------- | -------------- |
+| concur > 1        | 多 connect 很像扫描 |
+| 大量 proxy fallback | 像中转站           |
+| 高频 websocket.send | runtime 异常     |
+| DNS over HTTPS 高频 | 像 resolver     |
+| 全局 socks5         | 像匿名代理          |
+| 长时间大流量            | 容易触发资源限制       |
+
+---
+
+# 第二十二章：最推荐的稳定配置
+
+如果你目标是：
+
+```text
+长期稳定
+```
+
+建议：
+
+```js
+concur: 1
+```
+
+并且：
+
+* 优先直连
+* 失败 fallback
+* 不全局 proxy
+* 不做大规模 DNS
+* 不做大量 UDP
+
+这是最像：
+
+```text
+正常 websocket 应用
+```
+
+的行为。
+
+---
+
+# 第二十三章：这份代码真正厉害的地方
+
+很多人会觉得：
+
+```text
+不就是一个代理吗
+```
+
+但实际上真正厉害的是：
+
+```text
+作者非常理解：
+
+Cloudflare Workers 的 runtime 成本模型
+```
+
+它优化的不是：
+
+```text
+网络协议本身
+```
+
+而是：
+
+```text
+JS runtime 调度成本
+```
+
+这是很多传统代理作者不具备的思维。
+
+GrainTCP 的核心哲学：
+
+```text
+减少 runtime 次数
+比减少网络包更重要
+```
+
+这是非常 Cloudflare-native 的设计。
+
+---
+
+# 第二十四章：后续还能怎么演进
+
+未来方向：
+
+| 方向                   | 价值           |
+| -------------------- | ------------ |
+| xhttp                | 更像正常 HTTP    |
+| h2/h3                | 更像浏览器流量      |
+| ECH                  | 提高 TLS 隐蔽性   |
+| REALITY 前置           | 混合伪装         |
+| QUIC upstream        | 更低延迟         |
+| 智能 concur            | 动态并发         |
+| 自适应 grain            | 自动调包大小       |
+| 多 DoH                | DNS fallback |
+| DNS cache            | 降低 DoH 请求数   |
+| region-aware routing | 区域优化         |
+
+---
+
+# 最终总结
+
+这份 v2 的本质：
+
+```text
+一个兼顾：
+
+- GrainTCP 极简性能风格
+- 工程化代理 fallback
+- DNS over HTTPS
+- Worker runtime 优化
+
+的 Cloudflare VLESS WS 内核
+```
+
+它不是传统“完整代理框架”。
+
+而是：
+
+```text
+Cloudflare Runtime 上的高性能 socket forwarding engine
+```
+
+真正难的地方：
+
+不是协议。
+
+而是：
+
+```text
+如何在 CF runtime 的限制下
+把 runtime 调度成本压到极低
+```
+
+而 GrainTCP 的 grain/bundle/ripen/reap/mill 体系，本质上就是：
+
+```text
+把 JS runtime 当成需要优化的“网络栈”
+```
+
+这是它最有价值的地方。
