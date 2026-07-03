@@ -422,11 +422,11 @@ function getProxyCtx(request) {
     proxyType = m[1].toLowerCase() === 'http' ? 'http' : 'socks5';
     proxyAddress = m[2].split('#')[0];
     globalProxy = true;
-  } else if ((m = pathname.match(/\/(gs5|ghttp)=(.+)/i))) {
+  } else if ((m = pathname.match(/\/(g?s5|socks5|g?http)=(.+)/i))) {
     const type = m[1].toLowerCase();
-    proxyType = type === 'ghttp' ? 'http' : 'socks5';
+    proxyType = type.includes('http') ? 'http' : 'socks5';
     proxyAddress = m[2];
-    globalProxy = true;
+    globalProxy = type.startsWith('g') || globalProxy;
   }
 
   if (!(proxyType && proxyAddress)) return { globalProxy: false, proxyType: null, parsedProxy: {} };
