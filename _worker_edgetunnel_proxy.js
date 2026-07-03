@@ -164,14 +164,6 @@ const ws = async (req, ctx) => {
   return new Response(null, { status: 101, webSocket: client, headers: { 'Sec-WebSocket-Extensions': '' } });
 };
 
-/*
- * A/B proxy helpers derived from EdgeTunnel's SOCKS5/HTTP CONNECT handling.
- * Deliberately preserved for comparison:
- * - SOCKS5 uses target domain text (ATYP 0x03) for every target.
- * - SOCKS5 method proposal is [NO AUTH] only without credentials, or
- *   [NO AUTH, USER/PASS] when both credentials are supplied.
- * - HTTP CONNECT preserves bytes read after the proxy response header.
- */
 async function socks5Connect(fetcher, targetHost, targetPort, ctx) {
   const { username, password, hostname, port } = ctx.parsedProxy;
   const socket = await raceSprout(fetcher, hostname, port);
