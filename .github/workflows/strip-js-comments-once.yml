@@ -1,0 +1,113 @@
+name: Strip JavaScript comments once
+
+on:
+  push:
+    branches:
+      - test
+
+permissions:
+  contents: write
+
+jobs:
+  strip-comments:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: test
+          fetch-depth: 0
+
+      - name: Remove JavaScript comments
+        shell: bash
+        run: |
+          node <<'NODE'
+          const fs = require('node:fs');
+          const { execFileSync } = require('node:child_process');
+
+          const files = execFileSync('git', ['ls-files', '*.js'], { encoding: 'utf8' })
+            .split('\n')
+            .filter(Boolean);
+
+          function stripComments(source) {
+            let out = '';
+            let i = 0;
+            let state = 'code';
+            let escaped = false;
+
+            while (i < source.length) {
+              const c = source[i];
+              const n = source[i + 1];
+
+              if (state === 'line') {
+                if (c === '\n' || c === '\r') {
+                  out += c;
+                  state = 'code';
+                }
+                i++;
+                continue;
+              }
+
+              if (state === 'block') {
+                if (c === '*' && n === '/') {
+                  i += 2;
+                  state = 'code';
+                  continue;
+                }
+                if (c === '\n' || c === '\r') out += c;
+                i++;
+                continue;
+              }
+
+              if (state === 'single' || state === 'double' || state === 'template') {
+                out += c;
+                if (escaped) {
+                  escaped = false;
+                } else if (c === '\\') {
+                  escaped = true;
+                } else if ((state === 'single' && c === "'") || (state === 'double' && c === '"') || (state === 'template' && c === '`')) {
+                  state = 'code';
+                }
+                i++;
+                continue;
+              }
+
+              if (c === '/' && n === '/') {
+                state = 'line';
+                i += 2;
+                continue;
+              }
+              if (c === '/' && n === '*') {
+                state = 'block';
+                i += 2;
+                continue;
+              }
+              out += c;
+              if (c === "'") state = 'single';
+              else if (c === '"') state = 'double';
+              else if (c === '`') state = 'template';
+              i++;
+            }
+
+            return out.replace(/[ \t]+\n/g, '\n').replace(/\n{3,}/g, '\n\n');
+          }
+
+          for (const file of files) {
+            const source = fs.readFileSync(file, 'utf8');
+            const stripped = stripComments(source);
+            if (stripped !== source) fs.writeFileSync(file, stripped);
+          }
+          NODE
+
+      - name: Commit result and remove one-time workflow
+        shell: bash
+        run: |
+          git rm .github/workflows/strip-js-comments-once.yml
+          if git diff --quiet; then
+            exit 0
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          git commit -m 'chore: strip comments from JavaScript files'
+          git push origin HEAD:test
