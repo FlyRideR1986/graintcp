@@ -1,332 +1,276 @@
-# GrainTCP
+# GrainTCP — test 分支
 
-`GrainTCP.js` 是一个基于 Cloudflare Workers 的 WebSocket TCP relay 实现，重点不在附加协议功能，而在于围绕真实代理路径收敛小包传输优化。
+`test` 基于 `main` 创建，保留原版的 **VLESS over WebSocket + TCP relay** 主路径与小包传输优化；本分支只额外加入一个明确、可控的出口能力：**显式全局 HTTP CONNECT / SOCKS5 代理模式**。
 
-## 核心能力
+本分支不尝试在 Worker 端判断目标是否属于 Cloudflare CDN，也不做 DNS 预解析、ProxyIP 回退或“直连失败后自动改走代理”。目标的分流与节点选择应由客户端完成；Worker 只执行当前 URL 明确指定的连接方式。
 
-当前代码主线包含：
+## 本分支与 `main` 的差异
 
-- 普通 TCP 首包解析
-- WebSocket early data 接入
-- `request.fetcher.connect()` TCP 出站
-- 并发拨号竞争首个成功连接
-- 显式关闭 WebSocket 压缩协商
-- 上传侧机会性 grain 合包写入
-- 下载侧复用同一 grain 核，再加下载门控
-- BYOB 读取转发
-
-## 代码主路径
-
-```text
-Relay over WebSocket
-  → 解析 UUID / 目标地址 / 端口
-  → `request.fetcher.connect()` 并发建立 TCP
-  → 上传侧机会性收纳 + 合包后写入
-  → 下载侧大包直发 / 小包复用同一 grain 核后回传
-```
-
-## 出站接口
-
-当前代码最突出的点之一，就是**最先把 `request.fetcher.connect()` 这条灰接口直接引入到实际 TCP relay 主线里使用**，而不是继续停留在公开 `cloudflare:sockets.connect()` 的常规路径上。
-
-| 方式 | 类型 | 当前结论 |
+| 项目 | `main` | `test` |
 | --- | --- | --- |
-| `cloudflare:sockets.connect()` | 公开 API | 正式、稳定、直接出公网 TCP |
-| `request.fetcher.connect()` | undocumented 灰接口 | 当前代码实际使用；同样可直接出公网 TCP，但接口形态与可用性更依赖平台实现 |
+| VLESS + WebSocket TCP relay | 保留 | 保留，不改主状态机与转发逻辑 |
+| `request.fetcher.connect()` 直连 | 保留 | 保留 |
+| 并发连接竞速 `concur` | 保留 | 保留，默认值仍为 `4` |
+| HTTP CONNECT 出口 | 无 | 新增，仅在显式全局模式启用 |
+| SOCKS5 出口 | 无 | 新增，仅在显式全局模式启用 |
+| 自动失败回退到 HTTP/SOCKS | 无 | 不做 |
+| ProxyIP fallback | 无 | 不做 |
+| Worker 侧按目标 IP/CIDR 分流 | 无 | 不做 |
+| Worker 侧 DNS 分类或 UDP DNS -> DoH | 无 | 不做 |
 
-需要区分的一点：
-
-- 当前代码用的是 **request 级 `fetcher.connect()`**
-- 不是公开 service binding 那条 `Fetcher.connect()` 路径
-
-从 workerd 源码层面看，这两条入口最终都会落到同一套底层 TCP 建连实现上；差异主要不在“另一套 socket 引擎”，而在 **JS 层入口、fetcher 归属和通道来源**。
-
-对当前这份代码来说，`request.fetcher.connect()` 的意义主要有两点：
-
-1. 它不是公开导入 `cloudflare:sockets` 模块的常规写法，而是 **直接在 request 级 JS 上下文里取出的灰接口**  
-2. 在代码特征上，这条路径相比常规公开 socket 入口更小
-
-但要分清：
-
-- 这更接近 **入口形态差异**
-- 不是已经被源码或实测完全证明成“底层能力高一档的新 socket”
-
-当前可以确认的是：
-
-- `request.fetcher.connect()` **确实能直接出公网 TCP**
-- 它在底层仍与公开 `connect()` 共享同类建连路径
-- 它作为 JS 层新引入的灰接口，代码特征比常规公开 socket 模块更小
-
-## 设计重点
-
-### 1. UUID 热路径
-
-与以往所有代码不同，这一版没有把 UUID 校验继续留在请求期做循环逐字节比对，而是把 UUID 预解码前移到模块初始化阶段：先转成 16 字节，再拆成固定标量常量。
-
-这样请求真正进入请求热路径后，UUID 这一步只剩下两件事：
-
-- 长度不足直接返回
-- 16 个字节做固定位置直接比较，失败立刻返回
-
-这条路径的目的很明确：**把一次性工作留在初始化，把请求热路径压成最短的固定宽度判断**。对 `workerd` / V8 这类运行时来说，这比在每次请求里保留循环、偏移计算和额外分支更容易收紧成稳定热路径。
-
-本地 `Node v20.19.4` 基准：
-
-| 路径 | 以往处理方式 | 当前实现 | 谁更快 |
-| --- | ---: | ---: | --- |
-| UUID 命中匹配 | `53.26 ns/op` | `9.44 ns/op` | 当前实现约 `5.6x` |
-| UUID 尾部错误快速拒绝 | `51.63 ns/op` | `11.00 ns/op` | 当前实现约 `4.7x` |
-| 完整首包有效解析 | `220.67 ns/op` | `187.09 ns/op` | 当前实现约 `1.18x` |
-| 完整首包错误快速拒绝 | `52.56 ns/op` | `23.14 ns/op` | 当前实现约 `2.3x` |
-
-这里的 UUID 路径已经压到了 **纳秒级匹配 + 亚微秒级完整解析**，四项热路径对比里当前实现全部更快。
-
-### 2. 上传侧机会性合包
-
-当前主线不再保留早期那种偏重的“显式队列状态机”。
-
-现在上传侧保留的核心只有三件事：
-
-- 先把收到的 WebSocket 小块收进一个很薄的 grain 收纳核
-- drain 时把连续小块尽量 bundle 成更少的实际写入
-- 当前轮写完后，如果队列还没空，就立刻继续下一轮 drain
-
-也就是说，它已经从“带额外边界、额外拒收、额外参数层”的上传队列，收敛成：
+核心原则：
 
 ```text
-collect -> bundle -> writer.write()
+客户端决定“这一条流量该使用哪个 Worker 节点”
+    ↓
+Worker 只执行节点 URL 指定的模式
+    ↓
+Direct URL 只直连；Global Proxy URL 只走指定 HTTP/SOCKS 代理
 ```
 
-这里的重点已经不是“做一个复杂上传系统”，而是**把真正有用的那颗机会性合包核留下来**：
+## 连接模式
 
-- 小包不要一条一条立刻写
-- 同轮连续到达的小块，尽量并成更少的 `writer.write()`
-- 其余和主逻辑无关的重队列外壳都剔掉
+### 1. Direct：默认直连
 
-这条提炼后的上传路径，优化目标也更纯粹：
-
-- 减少高频小 `writer.write()` 调用
-- 减少 per-message 调度次数
-- 把原始很多条细碎 message 压成更少的实际写入
-
-当前实现对应：
-
-- grain 收纳核：先收，再并
-- `upPack = 20KB`：当前单次合包目标
-- drain 递归：上一轮写完后，若仍有积压就继续写
-
-这里说的“机会性”，意思不是固定等待，也不是强行憋包，而是：
-
-- **同一轮 drain 前后如果还有连续小块到达，就顺手继续并**
-- **没有连续 backlog 时，就直接把当前这一块交给 `writer.write()`**
-
-也正因为它不是硬等待模型，所以它同时保留了两头：
-
-- **默认路径尽量接近直写**
-- **一旦遇到 tiny packet storm，上限又能明显拉高**
-
-本地 `Node v20.19.4` 回放数据可以直接说明这一点。
-
-固定 `512B` 小包、`4096` 条原始 message、`upPack = 20KB`：
-
-| 模式 | 原始 message | 实际输出次数 | 最大单次输出 | 减少量 | 优化倍数 |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| 直接逐条写出 | `4096` | `4096` | `512B` | `0` | `1.0x` |
-| 当前机会性合包 | `4096` | `103` | `20480B` | `3993` | `39.8x` |
-
-随机 mixed 小包样本、`4096` 条原始 message、总字节 `4,767,543`：
-
-| 模式 | 实际输出次数 | 聚合输出次数 | 聚合吃入条数 | 减少量 | 优化倍数 |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| 直接逐条写出 | `4096` | `0` | `0` | `0` | `1.0x` |
-| 旧定时合包对照 | `3606` | `393` | `883` | `490` | `1.14x` |
-| 当前机会性合包 | `2280` | `1217` | `3033` | `1816` | `1.8x` |
-
-换句话说，这条上传侧主线并不是只追求“平均更平滑”，而是实打实地在**不引入重状态机的前提下，把上行 tiny message 风暴压成更少的实际 `writer.write()` 次数**。
-
-这条路优化的是 **JS 层写入次数和调度形态**。
-
-它的价值就是 **削减高频小包带来的固定成本**，而不是再造一层重型上传状态机。
-
-### 3. 下载侧大包直发与小包 grain 合包
-
-下载侧分成两部分：
-
-- **已定型的是大包直发主线**
-- **继续优化的是 `<32KB` 小包如何进入同一颗 grain 核**
-
-当前代码的下行主线很明确：
-
-- **大包**：`tx.reap()` → `ws.send(v)` → 立刻换新 BYOB buffer
-- **小包**：`v.slice()` 脱离原读缓冲 → 进入 grain 核 → 由下载门控决定何时 flush
-
-大包直发已经定型，原因很直接：
-
-- `ws.send(Uint8Array)` 底层不是立刻深拷贝，而是把当前 view 对应的 backing store 挂进 `outgoingMessages` 异步队列
-- 所以大包如果先 `slice()` 再发，只会平白多一次 JS copy
-- direct send 之后，这块读缓冲又不能继续复用，所以必须立刻换新 buffer
-
-大包路径现在就是一句话：
-
-> **direct send，随后立刻换新 buffer**
-
-这也是它比旧式“先大缓冲、再定时 flush”的下载写法更省开销的原因：
-
-- 旧写法会额外维护一整套大缓冲、offset、timer、resume、flush 状态
-- 大块数据常常先复制，再 send
-- 进入大文件阶段后，还会继续塞进 JS 缓冲再等定时器发出
-
-而当前这版的大包路径只保留两个必要动作：
-
-- **直接 send**
-- **换新 buffer**
-
-少了一次大块复制，也少了一层额外的 JS 发送系统。
-
-真正重要的变化在小包这一半：**下载侧不再维持一套和上传侧完全无关的小包模型，而是直接复用同一类 grain 收纳/合包核心，再在外面包一层下载专用门控。**
-
-也就是：
+Worker URL 没有完整有效的全局代理配置时，行为与 `main` 一致：
 
 ```text
-上传侧: collect -> bundle -> writer.write()
-下载侧: collect -> bundle -> gate(ripen/reap) -> ws.send()
+VLESS Client
+  ↓
+Cloudflare Worker
+  ↓ request.fetcher.connect(target)
+Target
 ```
 
-共享的是同一类基础动作：
-
-- 先收纳连续小块
-- 能并就并
-- 最后把更少的块送出去
-
-下载侧额外保留的，只是它自己的门控语义：
-
-- 小包还在连续增长时，再给一点点观察窗口
-- 如果缓冲接近上限，就立刻发
-- 如果增长停了，就把当前这一批发出去
-
-这里的 `32KB` 不是“必须攒满才发”的目标，而是 **聚合上限**：
-
-- `>= 32KB` 直接发
-- `< 32KB` 先进入 grain 核，再交给下载门控
-- 缓冲接近上限、同轮连续小包折叠完成，或极短 quiet-window 结束后就发
-
-所以它不是简单缓存，而是 **共享 grain 核 + 下载门控** 的轻量聚合。
-
-这部分针对的是 **高频小 frame 场景**：把很多 `<32KB` 小块压成更少的 `ws.send()` 次数，减少 frame 数、调度次数和 runtime 队列压力。
-
-本地 `Node v20.19.4` 的下行小包回放也能把这一点量化出来。
-
-固定 `512B` 小包、`4096` 条原始下行块：
-
-| 模式 | 实际输出次数 | 最大单次输出 | 减少量 | 优化倍数 |
-| --- | ---: | ---: | ---: | ---: |
-| 旧版 | `64` | `32768B` | `4032` | `64.0x` |
-| 新版 | `64` | `32768B` | `4032` | `64.0x` |
-
-这一组说明的是：**在极端连续 tiny packet storm 下，两者都会稳定顶到 `32KB cap flush`，所以纯 fixed 样本主要验证的是上限本身，没有把差异拉开。**
-
-更接近真实代理响应的是 mixed 小包样本。`4096` 条、`512..8192B`、总字节 `10,309,167`：
-
-| 模式 | 实际输出次数 | 聚合输出次数 | 聚合吃入条数 | 减少量 | 优化倍数 | 最大单次输出 |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| 旧版 | `2721` | `1102` | `2477` | `1375` | `1.51x` | `21686B` |
-| 新版 | `2030` | `1147` | `3223` | `2076` | `2.02x` | `32768B` |
-
-这组 mixed 样本对应的结论更接近当前主线：
-
-- 新版的小包压缩力度更高，实际输出次数从 `2721` 进一步压到 `2030`
-- 按输出次数算，新版相比旧版又多做了约 `1.34x` 的削减
-- 按减少量算，新版把 `saved` 从 `1375` 提到 `2076`，约是旧版的 `1.51x`
-
-它不是完整流控，也不是背压系统。`WebSocket.send()` 仍然没有可用的 drain / backpressure 信号；客户端慢的时候，runtime 内部队列仍然会继续增长。这个聚合器能做的，是尽量减小高频小 frame 对 `send()` 队列的放大。
-
-当前把 `dnPack` 收在 `32KB`，是因为更小的 `2KB / 4KB / 8KB` 虽然也会做一点合并，但还停留在原始小包尺度里，只有 `32KB` 才能把小包 frame 数压到另一个数量级。
-
-当前门控的关键不是长延时，而是：
-
-- `dnTail = 512B`：尾部接近满时直接发
-- `dnQr = 4`：连续增长观察的最多追加轮次
-
-`chunk = 64KB` 也只是当前通用默认档，不是源码硬上限。它的含义更接近“普通混合流量下更稳的工程档位”；在明确的大文件 bulk 场景里，更大的读块仍然可能成立。
-
-下载侧也没有继续走重型 JS 队列路线。`ws.send()` 底层本来就有自己的异步发送队列，JS 层再额外堆一整套大缓冲、timer 和状态机，通常只会多一次合并拷贝和更多调度开销。当前主线保留的是轻量小包聚合，不再重做一层下载发送系统。
-
-简化模型：
+示例：
 
 ```text
-T_direct = 32KB
-N_down ≈ B_down / E_down
-Cost_down ≈ N_down * (C_loop + F_big * C_rebuf) + P_small * B_down * k_slice
-Q_ws_out' ≈ R_sock_read - R_ws_drain
+https://your-worker.example.com/
 ```
 
-含义：
+此模式只有一次连接策略：直接连接目标。连接失败时会关闭当前会话，**不会**自动再尝试 HTTP、SOCKS5、ProxyIP、DoH 分类或其他回退路径。
 
-- `T_direct`：大小包分界；`>= 32KB` 直发，`< 32KB` 进入轻量聚合
-- `E_down`：下行平均交付块大小；越大，`N_down` 越小，`read + send + loop` 固定成本越低
-- `P_small`：走小包分支的字节占比；越高，`slice()` 复制成本越高
-- `F_big`：走大包直发分支的迭代占比；越高，补新 BYOB buffer 的次数越多
-- `Q_ws_out`：`ws.send()` 之后 runtime 内部的隐藏发送队列；当 `R_sock_read > R_ws_drain` 时继续增长
+### 2. Global SOCKS5：所有 TCP 目标经 SOCKS5
 
-当前主参数：
+在 URL 中同时提供 SOCKS5 地址与 `globalproxy`：
 
-- `dnPack = 32KB`
-- `dnTail = 512B`
-- `dnQr = 4`
+```text
+https://your-worker.example.com/?socks5=user:password@socks.example.com:1080&globalproxy
+```
 
-### 4. 并发拨号
+链路为：
 
-当 `concur = 4` 时，会同时发起多路 TCP 建连，谁先成功就使用谁，其余连接关闭。主要用于改善部分入口下的首连成功率和首包速度。
+```text
+VLESS Client
+  ↓
+Cloudflare Worker
+  ↓ TCP connect SOCKS5 server
+  ↓ SOCKS5 CONNECT targetHost:targetPort
+Target
+```
 
-这里保留并发拨号，不是随意设定的常数，而是因为 **同一目标在 Cloudflare runtime / 路由层本身就存在黑盒抖动**。即使目标服务器不变、入口不变，单路 `connect()` 的胜者 RTT 也会因为边缘调度、路径选择和 runtime 波动出现几毫秒级差异；并发竞速的意义，就是直接吃掉这一段波动，取当前轮里最快的那条。
+只提供 `socks5` 而不提供 `globalproxy` 不会启用代理：
 
-现有实测也支持这一点：同目标下，胜者拨号中位数可以从 `concur=1` 的 `33ms` 压到 `concur=2/3/4` 的 `30/30/29ms` 左右。也就是说，这里的并发不是为了堆复杂重试，而是为了在 CF 这一层做一次黑盒择快，直接降低 RTT。
+```text
+?socks5=user:password@socks.example.com:1080
+```
 
-当前 `4` 对应的是 **Workers / Pages 部署下的默认配置**。如果把这份代码改成 **Snippets** 形态使用，并发拨号应手动收回到 `1`，不要继续保留 `4`。
+上述形式仍按 Direct 处理。这是刻意设计：避免某个仅携带代理地址的 URL 意外改变出口语义。
 
-同时也要记住边界：这类竞速只适合 **单轮** 保留，不能在同一个 request 里继续叠多轮 fallback / retry / second race。原因不是逻辑复杂度，而是 request 级连接配额和 delayed-close 会先把收益吃掉。
+### 3. Global HTTP CONNECT：所有 TCP 目标经 HTTP 代理
 
-### 5. 禁用 WebSocket 压缩协商
+```text
+https://your-worker.example.com/?http=user:password@proxy.example.com:8080&globalproxy
+```
 
-当前代码在握手响应里显式把 `Sec-WebSocket-Extensions` 置空，目的不是“省一个 header”，而是**主动避免 relay 主路径进入 WebSocket 压缩协商**。
+链路为：
 
-原因也很直接：
+```text
+VLESS Client
+  ↓
+Cloudflare Worker
+  ↓ TCP connect HTTP proxy
+  ↓ HTTP CONNECT targetHost:targetPort
+Target
+```
 
-- relay 主路径传的是原始 TCP 字节流，很多真实场景里内部本来就是 TLS/HTTP2/QUIC 等高熵数据
-- 这类数据在 Worker 这一层再做 WS 压缩，通常换不来稳定收益
-- 反过来却会把压缩/解压、状态维护和 frame 处理的 CPU 成本继续抬高
+HTTP 代理需要支持 `CONNECT`。普通只支持 HTTP 请求转发、但不允许 `CONNECT` 隧道的代理不能用于 TLS/HTTPS 等 TCP relay 场景。
 
-换句话说，这里不是简单追求“字节看起来更小”，而是优先控制 relay 热路径里的 CPU 消耗。结合本地工程记录，更稳的结论是：
+## 推荐的路径写法
 
-- 即使某些场景下表面吞吐看起来会更大
-- WS 压缩仍会把 CPU 开销明显放大
+部分客户端导入 VLESS WebSocket 节点时，对 query string 的保留或编辑并不方便。为此，本分支同时支持路径形式；路径形式天然启用全局代理。
 
-因此当前主线把它直接视为负优化处理，不把 WS 压缩放进默认传输路径。
+### SOCKS5
+
+```text
+/socks5://user:password@socks.example.com:1080
+```
+
+或更简短：
+
+```text
+/gs5=user:password@socks.example.com:1080
+```
+
+### HTTP CONNECT
+
+```text
+/http://user:password@proxy.example.com:8080
+```
+
+或更简短：
+
+```text
+/ghttp=user:password@proxy.example.com:8080
+```
+
+完整 URL 示例：
+
+```text
+https://your-worker.example.com/gs5=user:password@socks.example.com:1080
+https://your-worker.example.com/ghttp=user:password@proxy.example.com:8080
+```
+
+`/socks5://...`、`/http://...`、`/gs5=...`、`/ghttp=...` 与 query 形式的区别只在传参方式；最终都是全局代理，不存在“先直连、失败再走代理”。
+
+## 代理地址格式
+
+使用以下格式：
+
+```text
+user:password@host:port
+host:port
+user:password@[IPv6]:port
+```
+
+示例：
+
+```text
+socks.example.com:1080
+alice:secret@socks.example.com:1080
+alice:secret@[2001:db8::10]:1080
+```
+
+注意事项：
+
+- SOCKS5 请显式写端口，通常是 `1080`；省略端口时代码会使用 `80`，通常不是你想要的结果。
+- 用户名或密码包含 `@`、`:`、`/`、`?`、`#`、`&`、`=` 等 URL 保留字符时，应先进行 URL percent-encoding；否则 URL 解析可能把它们误识别为分隔符。
+- HTTP Basic 认证仅在用户名和密码都存在时发送 `Proxy-Authorization`。
+- SOCKS5 支持无认证与用户名/密码认证。
+- Worker 必须能够直接连接代理入口本身。不要把 SOCKS/HTTP 入口部署在 Cloudflare 代理后的地址上，否则 Worker 到代理入口的连接仍可能被平台限制。
+
+## 客户端分流职责
+
+这个分支刻意不在 Worker 内做“智能分流”。建议把规则留在具备多节点 / outbound 路由能力的客户端中，例如 Karing、Mihomo、sing-box 或完整 Xray 配置。
+
+可建立两个逻辑节点：
+
+```text
+Worker-Direct
+  URL：不带 globalproxy
+  Worker 行为：只直连目标
+
+Worker-Global-SOCKS
+  URL：带 socks5=...&globalproxy，或 /gs5=...
+  Worker 行为：所有目标只经 SOCKS5
+```
+
+然后由客户端规则选择节点，例如：
+
+```text
+命中需要代理出口的目标 IP / 域名 / 规则集
+  → Worker-Global-SOCKS
+
+其他代理流量
+  → Worker-Direct
+```
+
+这样做的好处是：
+
+- Worker 不必为每一条连接额外 DNS 解析或 CIDR 判断；
+- 不会发生“Worker 先直连一次、失败后再 SOCKS5”的无效尝试；
+- 分流规则、DNS 策略和节点选择集中在客户端，便于观察与维护；
+- Worker 代码只保留基础 TCP relay 与明确出口语义。
+
+对于只支持“直连 / 当前代理 / 阻断”、但不能按规则选择不同代理节点的客户端，应在客户端选择一个固定模式：要么使用 Direct URL，要么使用 Global SOCKS/HTTP URL。不要期待本分支在后台自动补足分流。
+
+## 并发连接 `concur`
+
+本分支保留 `main` 的：
+
+```js
+concur: 4
+```
+
+它表示同一个 TCP endpoint 最多同时发起四次建连，最先成功的 socket 被保留，其余后续成功的连接关闭。
+
+在 Direct 模式下，竞速对象是：
+
+```text
+Worker → Target
+```
+
+在 Global SOCKS/HTTP 模式下，竞速对象变为：
+
+```text
+Worker → SOCKS / HTTP proxy entry
+```
+
+之后只有胜出的那一条连接继续执行 SOCKS5 握手或 HTTP CONNECT。因此 `concur: 4` 不会向目标站发送四次 SOCKS CONNECT / HTTP CONNECT；它只会放大 Worker 到代理入口这一跳的 TCP 建连。
+
+取舍：
+
+- Workers / Pages 形态：保留 `4`，延续原版的并发拨号策略；
+- Snippets 或希望减少连接放大：手动将 `concur` 改为 `1`；
+- 同一个代理入口的 `concur > 1` 不是多出口容灾，只是同一入口的建连竞速。
+
+## 当前边界
+
+本分支是 TCP relay，不是完整通用代理平台：
+
+- 只处理 VLESS TCP 主路径；不实现 VLESS UDP / UDP DNS 转 DoH；
+- 不解析目标 DNS，不维护 Cloudflare CIDR，不判断目标是否可由 Worker 直连；
+- 不提供 ProxyIP；
+- 不提供直连失败后的自动 HTTP/SOCKS 回退；
+- 不提供多个 HTTP/SOCKS 入口的负载均衡或健康检查；
+- SOCKS5 目标请求按域名字段发送目标地址；对字面 IPv6 目标的兼容性取决于 SOCKS5 服务端是否接受该形式。需要严格 IPv6 SOCKS ATYP 支持时，应单独扩展握手编码。
+
+这不是缺失，而是该分支的边界：把不确定的出口选择交给客户端，使服务端行为保持最小、明确、可预测。
+
+## 核心转发路径
+
+```text
+VLESS over WebSocket
+  → 解析 UUID / 目标地址 / 端口
+  → 根据当前 Worker URL 选择 Direct 或 Global Proxy
+  → 建立目标 TCP，或建立到 HTTP/SOCKS5 入口的 TCP 隧道
+  → 上传侧机会性 grain 合包后写入
+  → 下载侧大包直发 / 小包 grain 合包后回传
+```
 
 ## 当前配置
 
 | 变量 | 意义 | 默认值 |
 | --- | --- | --- |
-| `id` | UUID | `2523c510-9ff0-415b-9582-93949bfae7e3` |
+| `id` | VLESS UUID | `2523c510-9ff0-415b-9582-93949bfae7e3` |
 | `chunk` | BYOB 读取块大小 | `64 * 1024` |
 | `dnPack` | 下载侧 grain 聚合上限 | `32 * 1024` |
 | `dnTail` | 下载侧尾部阈值 | `512` |
 | `dnQr` | 下载侧连续增长观察轮次 | `4` |
 | `upPack` | 上传侧合包目标 | `20 * 1024` |
 | `maxED` | early data 上限 | `8 * 1024` |
-| `concur` | 并发拨号数；Workers / Pages 默认 `4`，Snippets 手动改 `1` | `4` |
-
-这些值对应的是当前主线路径下的收敛结果，不是随意占位参数。
+| `concur` | 并发拨号数；Workers / Pages 默认 `4`，Snippets 可改为 `1` | `4` |
 
 ## 文件
 
 | 文件 | 说明 |
 | --- | --- |
-| [GrainTCP.js](./GrainTCP.js) | Worker 主实现：首包解析、TCP 出站、统一 grain 核、BYOB 转发 |
+| [GrainTCP.js](./GrainTCP.js) | `test` 分支 Worker 主实现：VLESS TCP relay、显式全局 HTTP/SOCKS5、grain 合包、BYOB 转发 |
 
 ## 相关链接
 
 - 开源协议：[GPL-3.0](./LICENSE)
+- 原始项目：<https://github.com/ToiCF/GrainTCP>
 - fast-webstreams：<https://github.com/vercel-labs/fast-webstreams>
 - iter-streams：<https://github.com/WinterTC55/iter-streams>
 - 频道 / 交流群组：<https://t.me/Enkelte_notif>
