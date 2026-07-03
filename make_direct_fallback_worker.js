@@ -1,14 +1,4 @@
 #!/usr/bin/env node
-/**
- * Generates a deployable candidate worker without changing _worker.js.
- *
- * Usage:
- *   node make_direct_fallback_worker.js [source] [target]
- *
- * Defaults:
- *   source: _worker.js
- *   target: _worker.direct-fallback.js
- */
 
 import { readFile, writeFile } from 'node:fs/promises';
 

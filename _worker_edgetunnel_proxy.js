@@ -31,7 +31,7 @@ const relay = c => {
   const a = parseAddr(c, o + 3, t);
   return a ? { addrType: t, ...a, port: p } : null;
 };
-// Kept unchanged: explicit global proxy selects HTTP/SOCKS; otherwise direct raceSprout only.
+
 const smartConnect = (fetcher, host, port, ctx) =>
   ctx.globalProxy && ctx.proxyType === 'http' ? httpConnect(fetcher, host, port, ctx) :
   ctx.globalProxy && ctx.proxyType === 'socks5' ? socks5Connect(fetcher, host, port, ctx) :
@@ -113,7 +113,7 @@ const ws = async (req, ctx) => {
   server.binaryType = 'arraybuffer';
   const fetcher = req.fetcher;
   const edStr = req.headers.get('sec-websocket-protocol');
-  const ed = edStr && edStr.length <= CFG.maxED * 4 / 3 + 4 ? /** @type {*} */ (Uint8Array).fromBase64(edStr, { alphabet: 'base64url' }) : null;
+  const ed = edStr && edStr.length <= CFG.maxED * 4 / 3 + 4 ?  (Uint8Array).fromBase64(edStr, { alphabet: 'base64url' }) : null;
   let curW = null, sock = null, closed = false, busy = false;
   const uq = mkQ(CFG.upPack);
   const wither = () => {
@@ -280,7 +280,6 @@ async function httpConnect(fetcher, targetHost, targetPort, ctx) {
 
     reader.releaseLock();
 
-    // EdgeTunnel behavior: restore any tunnel bytes already received after the CONNECT header.
     if (bytesRead > headerEndIndex) {
       const { readable, writable } = new TransformStream();
       const transformWriter = writable.getWriter();

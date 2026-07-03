@@ -20,7 +20,7 @@ const raceSprout = (f, h, p, concur = CFG.concur) => {
   const ts = Array(n).fill().map(() => sprout(f, h, p));
   return Promise.any(ts).then(w => { ts.forEach(t => t.then(s => s !== w && s.close(), () => {})); return w; });
 };
-// Proxy entries normally have one host:port, so avoid redundant concurrent login/CONNECT attempts.
+
 const proxySprout = (f, h, p) => raceSprout(f, h, p, CFG.proxyConcur);
 const parseAddr = (b, o, t) => {
   const l = t === 3 ? b[o++] : t === 1 ? 4 : t === 4 ? 16 : null;
@@ -118,7 +118,7 @@ const ws = async (req, ctx) => {
   server.binaryType = 'arraybuffer';
   const fetcher = req.fetcher;
   const edStr = req.headers.get('sec-websocket-protocol');
-  const ed = edStr && edStr.length <= CFG.maxED * 4 / 3 + 4 ? /** @type {*} */ (Uint8Array).fromBase64(edStr, { alphabet: 'base64url' }) : null;
+  const ed = edStr && edStr.length <= CFG.maxED * 4 / 3 + 4 ?  (Uint8Array).fromBase64(edStr, { alphabet: 'base64url' }) : null;
   let curW = null, sock = null, closed = false, busy = false;
   const uq = mkQ(CFG.upPack);
   const wither = () => {
@@ -177,7 +177,6 @@ const findHeaderEnd = bytes => {
   return -1;
 };
 
-// Preserve bytes already received after CONNECT's HTTP header without losing BYOB support downstream.
 const withPrefixedReadable = (socket, reader, prefix) => {
   let pending = prefix;
   let released = false;
