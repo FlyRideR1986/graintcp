@@ -1,0 +1,52 @@
+name: Patch direct fallback routing once
+
+on:
+  push:
+    branches:
+      - test
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: test
+          fetch-depth: 0
+      - name: Patch only direct fallback route parsing
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path('_worker.direct-fallback.js')
+          source = path.read_text(encoding='utf-8')
+          old = """  } else if ((m = pathname.match(/\\/(gs5|ghttp)=(.+)/i))) {
+            const type = m[1].toLowerCase();
+            proxyType = type === 'ghttp' ? 'http' : 'socks5';
+            proxyAddress = m[2];
+            globalProxy = true;
+          }"""
+          new = """  } else if ((m = pathname.match(/\\/(g?s5|socks5|g?http)=(.+)/i))) {
+            const type = m[1].toLowerCase();
+            proxyType = type.includes('http') ? 'http' : 'socks5';
+            proxyAddress = m[2];
+            globalProxy = type.startsWith('g') || globalProxy;
+          }"""
+          if old not in source:
+            raise SystemExit('Expected getProxyCtx block not found; aborting without modifying the worker.')
+          path.write_text(source.replace(old, new, 1), encoding='utf-8')
+          PY
+      - name: Commit result and remove one-time workflow
+        shell: bash
+        run: |
+          git rm .github/workflows/patch-direct-fallback-routing-once.yml
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add _worker.direct-fallback.js
+          git commit -m 'fix: restore direct fallback proxy route parsing'
+          git push origin HEAD:test
