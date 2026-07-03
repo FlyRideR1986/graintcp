@@ -10,7 +10,6 @@ permissions:
 
 jobs:
   patch:
-    if: github.actor != 'github-actions[bot]'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -25,13 +24,13 @@ jobs:
 
           path = Path('_worker.direct-fallback.js')
           source = path.read_text(encoding='utf-8')
-          old = """  } else if ((m = pathname.match(/\\/(gs5|ghttp)=(.+)/i))) {
+          old = """  } else if ((m = pathname.match(/\/(gs5|ghttp)=(.+)/i))) {
             const type = m[1].toLowerCase();
             proxyType = type === 'ghttp' ? 'http' : 'socks5';
             proxyAddress = m[2];
             globalProxy = true;
           }"""
-          new = """  } else if ((m = pathname.match(/\\/(g?s5|socks5|g?http)=(.+)/i))) {
+          new = """  } else if ((m = pathname.match(/\/(g?s5|socks5|g?http)=(.+)/i))) {
             const type = m[1].toLowerCase();
             proxyType = type.includes('http') ? 'http' : 'socks5';
             proxyAddress = m[2];
