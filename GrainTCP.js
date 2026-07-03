@@ -1,6 +1,6 @@
 const CFG = { id: '2523c510-9ff0-415b-9582-93949bfae7e3', chunk: 64 * 1024, dnPack: 32 * 1024, dnTail: 512, dnQr: 4, upPack: 20 * 1024, maxED: 8 * 1024, concur: 4 };
-export default { fetch: req => req.headers.get('Upgrade')?.toLowerCase() === 'websocket' ? ws(req) : new Response('Hello world!') }; const hex = c => (c > 64 ? c + 9 : c) & 0xF;
-const idB = new Uint8Array(16), dec = new TextDecoder(); for (let i = 0, p = 0, c, h; i < 16; i++) { c = CFG.id.charCodeAt(p++); c === 45 && (c = CFG.id.charCodeAt(p++)); h = hex(c); c = CFG.id.charCodeAt(p++); c === 45 && (c = CFG.id.charCodeAt(p++)); idB[i] = h << 4 | hex(c); }
+export default { fetch: async req => req.headers.get('Upgrade')?.toLowerCase() === 'websocket' ? ws(req, getProxyCtx(req)) : new Response('Hello world!') }; const hex = c => (c > 64 ? c + 9 : c) & 0xF;
+const idB = new Uint8Array(16), dec = new TextDecoder(), enc = new TextEncoder(); for (let i = 0, p = 0, c, h; i < 16; i++) { c = CFG.id.charCodeAt(p++); c === 45 && (c = CFG.id.charCodeAt(p++)); h = hex(c); c = CFG.id.charCodeAt(p++); c === 45 && (c = CFG.id.charCodeAt(p++)); idB[i] = h << 4 | hex(c); }
 const [I0, I1, I2, I3, I4, I5, I6, I7, I8, I9, I10, I11, I12, I13, I14, I15] = idB;
 const matchID = c => c[1] === I0 && c[2] === I1 && c[3] === I2 && c[4] === I3 && c[5] === I4 && c[6] === I5 && c[7] === I6 && c[8] === I7 && c[9] === I8 && c[10] === I9 && c[11] === I10 && c[12] === I11 && c[13] === I12 && c[14] === I13 && c[15] === I14 && c[16] === I15;
 const addr = (t, b) => t === 1 ? `${b[0]}.${b[1]}.${b[2]}.${b[3]}` : t === 3 ? dec.decode(b) : `[${Array.from({ length: 8 }, (_, i) => ((b[i * 2] << 8) | b[i * 2 + 1]).toString(16)).join(':')}]`;
@@ -8,6 +8,7 @@ const sprout = (f, h, p, s = f.connect({ hostname: h, port: p })) => s.opened.th
 const raceSprout = (f, h, p) => { if (!f?.connect) return Promise.reject(new Error('connect unavailable')); if (CFG.concur <= 1) return sprout(f, h, p); const ts = Array(CFG.concur).fill().map(() => sprout(f, h, p)); return Promise.any(ts).then(w => { ts.forEach(t => t.then(s => s !== w && s.close(), () => {})); return w; }); };
 const parseAddr = (b, o, t) => { const l = t === 3 ? b[o++] : t === 1 ? 4 : t === 4 ? 16 : null; if (l === null) return null; const n = o + l; return n > b.length ? null : { targetAddrBytes: b.subarray(o, n), dataOffset: n }; };
 const relay = c => { if (c.length < 24 || !matchID(c)) return null; let o = 19 + c[17]; const p = (c[o] << 8) | c[o + 1]; let t = c[o + 2]; if (t !== 1) t += 1; const a = parseAddr(c, o + 3, t); return a ? { addrType: t, ...a, port: p } : null; };
+const smartConnect = (fetcher, host, port, ctx) => ctx.globalProxy && ctx.proxyType === 'http' ? httpConnect(fetcher, host, port, ctx) : ctx.globalProxy && ctx.proxyType === 'socks5' ? socks5Connect(fetcher, host, port, ctx) : raceSprout(fetcher, host, port);
 const mkK = (cap, cpy = 0) => { let q = [], h = 0, b = 0, buf = null;
   const e = () => h >= q.length, trim = () => { h > 32 && h * 2 >= q.length && (q = q.slice(h), h = 0); }, clear = () => { q = []; h = 0; b = 0; };
   const take = () => { if (e()) return null; const d = q[h]; q[h++] = undefined; b -= d.byteLength; trim(); return d; };
@@ -28,7 +29,7 @@ const mkDn = w => { const cap = CFG.dnPack, tail = CFG.dnTail, low = Math.max(40
       k.sow(o || m !== n ? u.subarray(o, o + m) : u); gen++; o += m; if (k.b >= cap || cap - k.b < tail) reap(); else ripen(); } }, reap }; };
 const mill = async (rd, w) => { const r = rd.getReader({ mode: 'byob' }), tx = mkDn(w); let buf = new ArrayBuffer(CFG.chunk);
   try { for (;;) { const { done, value: v } = await r.read(new Uint8Array(buf, 0, CFG.chunk)); if (done) break; if (!v?.byteLength) continue; if (v.byteLength >= (CFG.chunk >> 1)) tx.reap(), w.send(v), buf = new ArrayBuffer(CFG.chunk); else tx.send(v.slice()), buf = v.buffer; } tx.reap(); } catch {} finally { try { tx.reap(); } catch {} try { r.releaseLock(); } catch {} } };
-const ws = async req => {
+const ws = async (req, ctx) => {
   const [client, server] = Object.values(new WebSocketPair()); server.accept({ allowHalfOpen: true }); server.binaryType = 'arraybuffer'; const fetcher = req.fetcher;
   const edStr = req.headers.get('sec-websocket-protocol'); const ed = edStr && edStr.length <= CFG.maxED * 4 / 3 + 4 ? /** @type {*} */ (Uint8Array).fromBase64(edStr, { alphabet: 'base64url' }) : null; let curW = null, sock = null, closed = false, busy = false;
   const uq = mkQ(CFG.upPack);
@@ -36,10 +37,78 @@ const ws = async req => {
   const toU8 = d => d instanceof Uint8Array ? d : ArrayBuffer.isView(d) ? new Uint8Array(d.buffer, d.byteOffset, d.byteLength) : new Uint8Array(d);
   const sow = d => { const u = toU8(d), n = u.byteLength; if (!n) return 1; if (uq.sow(u)) return 1; wither(); return 0; };
   const thresh = async () => { if (busy || closed) return; busy = true; try { for (;;) {
-    if (closed) break; if (!sock) { const [d] = uq.bundle(); if (!d) break; const r = relay(d); if (!r) throw wither(); server.send(new Uint8Array([d[0], 0])); const host = addr(r.addrType, r.targetAddrBytes), port = r.port, payload = d.subarray(r.dataOffset); sock = await raceSprout(fetcher, host, port); if (!sock) throw wither(); curW = sock.writable.getWriter(); const [first] = uq.bundle(payload); first?.byteLength && await curW.write(first); mill(sock.readable, server).finally(() => wither()); continue; }
+    if (closed) break; if (!sock) { const [d] = uq.bundle(); if (!d) break; const r = relay(d); if (!r) throw wither(); server.send(new Uint8Array([d[0], 0])); const host = addr(r.addrType, r.targetAddrBytes), port = r.port, payload = d.subarray(r.dataOffset); sock = await smartConnect(fetcher, host, port, ctx); if (!sock) throw wither(); curW = sock.writable.getWriter(); const [first] = uq.bundle(payload); first?.byteLength && await curW.write(first); mill(sock.readable, server).finally(() => wither()); continue; }
     const [d] = uq.bundle(); if (!d) break; await curW.write(d);
   } } catch { wither(); } finally { busy = false; !uq.empty && !closed && thresh(); } };
   if (ed && sow(ed)) thresh();
   server.addEventListener('message', e => { closed || (sow(e.data) && thresh()); });
   server.addEventListener('close', () => wither()); server.addEventListener('error', () => wither());
   return new Response(null, { status: 101, webSocket: client, headers: { 'Sec-WebSocket-Extensions': '' } }); };
+
+async function httpConnect(fetcher, targetHost, targetPort, ctx) {
+  const { username, password, hostname, port } = ctx.parsedProxy;
+  const sock = await raceSprout(fetcher, hostname, port);
+  const w = sock.writable.getWriter(), r = sock.readable.getReader();
+  try {
+    const auth = username && password ? `Proxy-Authorization: Basic ${btoa(`${username}:${password}`)}\r\n` : '';
+    const req = `CONNECT ${targetHost}:${targetPort} HTTP/1.1\r\nHost: ${targetHost}:${targetPort}\r\n${auth}Proxy-Connection: Keep-Alive\r\nConnection: Keep-Alive\r\n\r\n`;
+    await w.write(enc.encode(req));
+    let buf = new Uint8Array(0);
+    for (;;) {
+      const { value, done } = await r.read();
+      if (done) throw new Error('http proxy closed');
+      if (!value?.byteLength) continue;
+      const m = new Uint8Array(buf.length + value.length); m.set(buf); m.set(value, buf.length); buf = m;
+      const s = dec.decode(buf), i = s.indexOf('\r\n\r\n');
+      if (i < 0) { if (buf.length > 8192) throw new Error('http proxy header too large'); continue; }
+      const h = s.slice(0, i);
+      if (!h.startsWith('HTTP/1.1 200') && !h.startsWith('HTTP/1.0 200')) throw new Error(h.split('\r\n')[0]);
+      return sock;
+    }
+  } finally { try { w.releaseLock(); } catch {} try { r.releaseLock(); } catch {} }
+}
+
+async function socks5Connect(fetcher, targetHost, targetPort, ctx) {
+  const { username, password, hostname, port } = ctx.parsedProxy;
+  const sock = await raceSprout(fetcher, hostname, port);
+  const w = sock.writable.getWriter(), r = sock.readable.getReader();
+  try {
+    await w.write(new Uint8Array([5, 2, 0, 2]));
+    const a = (await r.read()).value;
+    if (!a || a[0] !== 5) throw new Error('bad socks5 auth response');
+    if (a[1] === 2) {
+      if (!username || !password) throw new Error('socks5 auth required');
+      const u = enc.encode(username), p = enc.encode(password);
+      await w.write(new Uint8Array([1, u.length, ...u, p.length, ...p]));
+      const ar = (await r.read()).value;
+      if (!ar || ar[1] !== 0) throw new Error('socks5 auth failed');
+    } else if (a[1] !== 0) throw new Error(`socks5 method ${a[1]}`);
+    const d = enc.encode(targetHost);
+    await w.write(new Uint8Array([5, 1, 0, 3, d.length, ...d, targetPort >> 8, targetPort & 255]));
+    const cr = (await r.read()).value;
+    if (!cr || cr[1] !== 0) throw new Error(`socks5 connect ${cr?.[1]}`);
+    return sock;
+  } finally { try { w.releaseLock(); } catch {} try { r.releaseLock(); } catch {} }
+}
+
+function parseProxyAddress(address) {
+  const lastAt = address.lastIndexOf('@'), latter = lastAt === -1 ? address : address.substring(lastAt + 1), former = lastAt === -1 ? '' : address.substring(0, lastAt);
+  let username, password; if (former) [username, password] = former.split(':');
+  let hostname, port;
+  if (latter.includes(']:')) { port = Number(latter.split(']:')[1].replace(/[^\d]/g, '')); hostname = latter.split(']:')[0] + ']'; }
+  else { const i = latter.lastIndexOf(':'); if (i > -1) { hostname = latter.slice(0, i); port = Number(latter.slice(i + 1).replace(/[^\d]/g, '')); } else { hostname = latter; port = 80; } }
+  if (!hostname || !Number.isInteger(port) || port < 1 || port > 65535) throw new Error('invalid proxy address');
+  return { username, password, hostname, port };
+}
+
+function getProxyCtx(request) {
+  const url = new URL(request.url), { pathname, searchParams } = url;
+  let proxyType = null, proxyAddress = '', globalProxy = searchParams.has('globalproxy'), m;
+  if (searchParams.has('http')) { proxyType = 'http'; proxyAddress = searchParams.get('http') || ''; }
+  else if (searchParams.has('socks5')) { proxyType = 'socks5'; proxyAddress = searchParams.get('socks5') || ''; }
+  if ((m = pathname.match(/\/(socks5?|http):\/?\/?(.+)/i))) { proxyType = m[1].toLowerCase() === 'http' ? 'http' : 'socks5'; proxyAddress = m[2].split('#')[0]; globalProxy = true; }
+  else if ((m = pathname.match(/\/(gs5|ghttp)=(.+)/i))) { const type = m[1].toLowerCase(); proxyType = type === 'ghttp' ? 'http' : 'socks5'; proxyAddress = m[2]; globalProxy = true; }
+  if (!(globalProxy && proxyType && proxyAddress)) return { globalProxy: false, proxyType: null, parsedProxy: {} };
+  try { return { globalProxy: true, proxyType, parsedProxy: parseProxyAddress(proxyAddress) }; }
+  catch { return { globalProxy: false, proxyType: null, parsedProxy: {} }; }
+}
