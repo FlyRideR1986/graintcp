@@ -11,14 +11,12 @@ const oldSmartConnect = `const smartConnect = (fetcher, host, port, ctx) =>
   raceSprout(fetcher, host, port);`;
 
 const newSmartConnect = `const smartConnect = async (fetcher, host, port, ctx) => {
-  // Explicit global mode always wins: do not expose a direct-connection attempt.
   if (ctx.globalProxy && ctx.proxyType === 'http') return httpConnect(fetcher, host, port, ctx);
   if (ctx.globalProxy && ctx.proxyType === 'socks5') return socks5Connect(fetcher, host, port, ctx);
 
   try {
     return await raceSprout(fetcher, host, port);
   } catch (directError) {
-    // A configured non-global proxy is a fallback only after every direct attempt fails.
     if (ctx.proxyType === 'http') return httpConnect(fetcher, host, port, ctx);
     if (ctx.proxyType === 'socks5') return socks5Connect(fetcher, host, port, ctx);
     throw directError;
@@ -29,8 +27,7 @@ const oldGetProxyCtxTail = `  if (!(globalProxy && proxyType && proxyAddress)) r
   try { return { globalProxy: true, proxyType, parsedProxy: parseProxyAddress(proxyAddress) }; }
   catch { return { globalProxy: false, proxyType: null, parsedProxy: {} }; }`;
 
-const newGetProxyCtxTail = `  // Keep a valid proxy configuration even without globalproxy: smartConnect() will use it as fallback.
-  if (!(proxyType && proxyAddress)) return { globalProxy: false, proxyType: null, parsedProxy: {} };
+const newGetProxyCtxTail = `  if (!(proxyType && proxyAddress)) return { globalProxy: false, proxyType: null, parsedProxy: {} };
   try { return { globalProxy, proxyType, parsedProxy: parseProxyAddress(proxyAddress) }; }
   catch { return { globalProxy: false, proxyType: null, parsedProxy: {} }; }`;
 
