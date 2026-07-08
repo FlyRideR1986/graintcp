@@ -1,4 +1,4 @@
-const CFG = { id: '', chunk: 64 * 1024, dnPack: 32 * 1024, dnTail: 512, dnQr: 4, upPack: 20 * 1024, maxED: 8 * 1024, concur: 1, proxyConcur: 1 };
+const CFG = { id: '', chunk: 64 * 1024, dnPack: 32 * 1024, dnTail: 512, dnQr: 4, upPack: 20 * 1024, maxED: 8 * 1024, concur: 4, proxyConcur: 1 };
 export default { fetch: async req => req.headers.get('Upgrade')?.toLowerCase() === 'websocket' ? ws(req, getProxyCtx(req)) : new Response('Hello world!') };
 
 const hex = c => (c > 64 ? c + 9 : c) & 0xF;
